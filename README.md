@@ -17,6 +17,7 @@ With the binary on your `PATH`, it can also be run as `git balai`.
 git balai            # delete merged branches
 git balai -dry-run   # only show what would be deleted
 git balai -worktrees # also remove worktrees of merged branches
+git balai -version   # print the version
 ```
 
 It runs in the current repository and:

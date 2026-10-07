@@ -13,9 +13,42 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 )
+
+// version is set at build time with -ldflags "-X main.version=...". When
+// empty, it is derived from the build information embedded by the Go toolchain.
+var version string
+
+func getVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	var revision, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if revision != "" {
+		return "devel-" + revision[:min(len(revision), 12)] + dirty
+	}
+	return "devel"
+}
 
 var preferredRemotes = []string{"origin", "github", "work"}
 
@@ -538,8 +571,9 @@ func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) erro
 func main() {
 	dryRun := flag.Bool("dry-run", false, "show which branches would be deleted without deleting them")
 	removeWorktrees := flag.Bool("worktrees", false, "also remove clean, unlocked worktrees of merged branches")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run] [-worktrees]\n\n"+
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run] [-worktrees] [-version]\n\n"+
 			"Delete local branches that have been merged, rebased or squashed into the remote's primary branch.\n\n")
 		flag.PrintDefaults()
 	}
@@ -547,6 +581,10 @@ func main() {
 	if flag.NArg() > 0 {
 		flag.Usage()
 		os.Exit(2)
+	}
+	if *showVersion {
+		fmt.Println("git-balai", getVersion())
+		return
 	}
 
 	wd, err := os.Getwd()
