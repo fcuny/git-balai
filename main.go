@@ -45,6 +45,18 @@ type branch struct {
 type mergedBranch struct {
 	branch
 	Kind mergeKind
+	// Worktree is the linked worktree the branch is checked out in, if any.
+	// It has to be removed before the branch can be deleted.
+	Worktree *worktree
+}
+
+type worktree struct {
+	Path   string
+	Branch string // empty when HEAD is detached
+	Locked bool
+	// Prunable is set when the worktree's directory is gone and only git's
+	// administrative files remain.
+	Prunable bool
 }
 
 func NewGitRepository(workingDir string) (*GitRepository, error) {
@@ -216,23 +228,67 @@ func (r *GitRepository) ancestorBranches() (map[string]bool, error) {
 	return ancestors, nil
 }
 
-// protectedBranches returns the branches that must not be deleted: the
-// primary branch and any branch checked out in a worktree, including the
-// current one.
-func (r *GitRepository) protectedBranches() (map[string]bool, error) {
+// worktrees returns all the worktrees of the repository, the main one first.
+func (r *GitRepository) worktrees() ([]worktree, error) {
 	out, err := r.runGitCommand("worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktrees(out), nil
+}
+
+// parseWorktrees parses the output of `git worktree list --porcelain`.
+func parseWorktrees(out string) []worktree {
+	var wts []worktree
+	for _, block := range strings.Split(strings.TrimSpace(out), "\n\n") {
+		var wt worktree
+		for _, line := range strings.Split(block, "\n") {
+			key, value, _ := strings.Cut(line, " ")
+			switch key {
+			case "worktree":
+				wt.Path = value
+			case "branch":
+				wt.Branch = strings.TrimPrefix(value, "refs/heads/")
+			case "locked":
+				wt.Locked = true
+			case "prunable":
+				wt.Prunable = true
+			}
+		}
+		if wt.Path != "" {
+			wts = append(wts, wt)
+		}
+	}
+	return wts
+}
+
+// protectedBranches returns the branches that must not be deleted: the
+// primary branch and the branches checked out in the main and the current
+// worktree.
+func (r *GitRepository) protectedBranches(wts []worktree) (map[string]bool, error) {
+	current, err := r.runGitCommand("branch", "--show-current")
 	if err != nil {
 		return nil, err
 	}
 
 	protected := map[string]bool{r.PrimaryBranch: true}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		if name, ok := strings.CutPrefix(scanner.Text(), "branch refs/heads/"); ok {
-			protected[name] = true
-		}
+	if current = strings.TrimSpace(current); current != "" {
+		protected[current] = true
 	}
-	return protected, scanner.Err()
+	if len(wts) > 0 && wts[0].Branch != "" {
+		protected[wts[0].Branch] = true
+	}
+	return protected, nil
+}
+
+// worktreeIsClean reports whether the worktree has no modified or untracked
+// files, which `git worktree remove` would refuse to discard.
+func (r *GitRepository) worktreeIsClean(path string) (bool, error) {
+	out, err := r.runGitCommand("-C", path, "status", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "", nil
 }
 
 // isRebased reports whether every commit on the branch has an equivalent
@@ -336,8 +392,10 @@ func (r *GitRepository) branchMergeKind(name string, ancestors map[string]bool) 
 }
 
 // getMergedBranches returns the local branches that can be safely deleted
-// because their changes are in the upstream primary branch.
-func (r *GitRepository) getMergedBranches() ([]mergedBranch, error) {
+// because their changes are in the upstream primary branch. A branch checked
+// out in a linked worktree is only returned when removeWorktrees is set and
+// the worktree is neither locked nor dirty.
+func (r *GitRepository) getMergedBranches(removeWorktrees bool) ([]mergedBranch, error) {
 	branches, err := r.localBranches()
 	if err != nil {
 		return nil, err
@@ -348,9 +406,21 @@ func (r *GitRepository) getMergedBranches() ([]mergedBranch, error) {
 		return nil, err
 	}
 
-	protected, err := r.protectedBranches()
+	wts, err := r.worktrees()
 	if err != nil {
 		return nil, err
+	}
+
+	protected, err := r.protectedBranches(wts)
+	if err != nil {
+		return nil, err
+	}
+
+	worktreeOf := make(map[string]*worktree)
+	for i := range wts {
+		if wts[i].Branch != "" {
+			worktreeOf[wts[i].Branch] = &wts[i]
+		}
 	}
 
 	var merged []mergedBranch
@@ -368,14 +438,49 @@ func (r *GitRepository) getMergedBranches() ([]mergedBranch, error) {
 		}
 
 		if protected[b.Name] {
-			log.Printf("Keeping %s: %s but checked out in a worktree", b.Name, kind)
+			log.Printf("Keeping %s: %s but checked out in the current or main worktree", b.Name, kind)
 			continue
 		}
 
-		merged = append(merged, mergedBranch{branch: b, Kind: kind})
+		wt := worktreeOf[b.Name]
+		if wt != nil && !wt.Prunable {
+			if wt.Locked {
+				log.Printf("Keeping %s: %s but checked out in locked worktree %s", b.Name, kind, wt.Path)
+				continue
+			}
+			if !removeWorktrees {
+				log.Printf("Keeping %s: %s but checked out in worktree %s (use -worktrees to remove it)", b.Name, kind, wt.Path)
+				continue
+			}
+			clean, err := r.worktreeIsClean(wt.Path)
+			if err != nil {
+				return nil, fmt.Errorf("checking worktree %s: %w", wt.Path, err)
+			}
+			if !clean {
+				log.Printf("Keeping %s: %s but worktree %s has changes", b.Name, kind, wt.Path)
+				continue
+			}
+		}
+
+		merged = append(merged, mergedBranch{branch: b, Kind: kind, Worktree: wt})
 	}
 
 	return merged, nil
+}
+
+// removeWorktree removes the worktree the branch is checked out in. A
+// prunable worktree's directory is already gone, so pruning drops what's left.
+// Removal isn't forced: git refuses if the worktree gained changes since
+// getMergedBranches checked it.
+func (r *GitRepository) removeWorktree(wt *worktree) error {
+	args := []string{"worktree", "remove", wt.Path}
+	if wt.Prunable {
+		args = []string{"worktree", "prune"}
+	}
+	if _, err := r.runGitCommand(args...); err != nil {
+		return fmt.Errorf("failed to remove worktree %s: %w", wt.Path, err)
+	}
+	return nil
 }
 
 // deleteBranch force-deletes a branch. `git branch -d` isn't enough: it checks
@@ -390,8 +495,8 @@ func (r *GitRepository) deleteBranch(b mergedBranch) error {
 }
 
 // cleanupMergedBranches deletes all local branches that have been merged into the primary branch
-func (r *GitRepository) cleanupMergedBranches(dryRun bool) error {
-	mergedBranches, err := r.getMergedBranches()
+func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) error {
+	mergedBranches, err := r.getMergedBranches(removeWorktrees)
 	if err != nil {
 		return err
 	}
@@ -405,8 +510,19 @@ func (r *GitRepository) cleanupMergedBranches(dryRun bool) error {
 	var errs []error
 	for _, b := range mergedBranches {
 		if dryRun {
+			if b.Worktree != nil {
+				log.Printf("Would remove worktree: %s", b.Worktree.Path)
+			}
 			log.Printf("Would delete: %s (%s, was %s)", b.Name, b.Kind, b.SHA)
 			continue
+		}
+		if b.Worktree != nil {
+			if err := r.removeWorktree(b.Worktree); err != nil {
+				log.Printf("Error: %v", err)
+				errs = append(errs, err)
+				continue
+			}
+			log.Printf("Removed worktree: %s", b.Worktree.Path)
 		}
 		if err := r.deleteBranch(b); err != nil {
 			log.Printf("Error: %v", err)
@@ -421,8 +537,9 @@ func (r *GitRepository) cleanupMergedBranches(dryRun bool) error {
 
 func main() {
 	dryRun := flag.Bool("dry-run", false, "show which branches would be deleted without deleting them")
+	removeWorktrees := flag.Bool("worktrees", false, "also remove clean, unlocked worktrees of merged branches")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run]\n\n"+
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run] [-worktrees]\n\n"+
 			"Delete local branches that have been merged, rebased or squashed into the remote's primary branch.\n\n")
 		flag.PrintDefaults()
 	}
@@ -450,7 +567,7 @@ func main() {
 		log.Println("Running in dry-run mode")
 	}
 
-	if err := repo.cleanupMergedBranches(*dryRun); err != nil {
+	if err := repo.cleanupMergedBranches(*dryRun, *removeWorktrees); err != nil {
 		log.Fatalf("Failed to cleanup merged branches: %v", err)
 	}
 }
