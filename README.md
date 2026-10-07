@@ -16,6 +16,7 @@ With the binary on your `PATH`, it can also be run as `git balai`.
 ```sh
 git balai            # delete merged branches
 git balai -dry-run   # only show what would be deleted
+git balai -worktrees # also remove worktrees of merged branches
 ```
 
 It runs in the current repository and:
@@ -30,9 +31,16 @@ It runs in the current repository and:
    - **rebased**: every commit has an equivalent commit (same patch) upstream;
    - **squashed**: the branch's combined changes match a single upstream commit.
 
-It never deletes the primary branch, the current branch, or a branch checked
-out in another worktree. Each deleted branch is logged with its commit, so it
-can be restored with `git branch <name> <commit>`.
+It never deletes the primary branch, or the branch checked out in the current
+or the main worktree. Each deleted branch is logged with its commit, so it can
+be restored with `git branch <name> <commit>`.
+
+A merged branch checked out in a linked worktree is kept, unless `-worktrees`
+is given. Then the worktree is removed with `git worktree remove` and the
+branch is deleted, but only if the worktree is not locked and has no modified
+or untracked files. Ignored files (build output, `.env`, ...) don't count as
+changes and are removed with the worktree, so check with `-dry-run` first.
+A worktree whose directory was already deleted is pruned without `-worktrees`.
 
 A squash merge whose conflicts were resolved differently from the branch, or
 that was edited before landing, won't match and the branch is kept.

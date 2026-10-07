@@ -99,15 +99,20 @@ func (f *fixture) branches(t *testing.T) []string {
 
 func runCleanup(t *testing.T, dir string, dryRun bool) []mergedBranch {
 	t.Helper()
+	return runCleanupWorktrees(t, dir, dryRun, false)
+}
+
+func runCleanupWorktrees(t *testing.T, dir string, dryRun, removeWorktrees bool) []mergedBranch {
+	t.Helper()
 	repo, err := NewGitRepository(dir)
 	if err != nil {
 		t.Fatalf("NewGitRepository: %v", err)
 	}
-	merged, err := repo.getMergedBranches()
+	merged, err := repo.getMergedBranches(removeWorktrees)
 	if err != nil {
 		t.Fatalf("getMergedBranches: %v", err)
 	}
-	if err := repo.cleanupMergedBranches(dryRun); err != nil {
+	if err := repo.cleanupMergedBranches(dryRun, removeWorktrees); err != nil {
 		t.Fatalf("cleanupMergedBranches: %v", err)
 	}
 	return merged
@@ -206,6 +211,140 @@ func TestKeepsCheckedOutBranches(t *testing.T) {
 		t.Errorf("merged branches = %v, want none", kinds(merged))
 	}
 	assertBranches(t, f, "main", "current", "in-worktree")
+}
+
+// mergeIntoRemote pushes the named branches and merges them upstream.
+func (f *fixture) mergeIntoRemote(t *testing.T, names ...string) {
+	t.Helper()
+	var cmds [][]string
+	for _, name := range names {
+		f.pushFeature(t, "origin", name, name)
+		cmds = append(cmds, []string{"merge", "--quiet", "--no-ff", "-m", "merge", "origin/" + name})
+	}
+	f.landOnRemote(t, cmds...)
+}
+
+func (f *fixture) addWorktree(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(f.root, "wt-"+name)
+	git(t, f.work, "worktree", "add", "--quiet", path, name)
+	return path
+}
+
+func exists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Stat(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+func TestRemovesWorktreesOfMergedBranches(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "clean", "ignored", "dirty", "locked")
+	f.pushFeature(t, "origin", "unmerged", "x")
+	if err := os.WriteFile(filepath.Join(f.work, ".git", "info", "exclude"), []byte("*.log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	clean := f.addWorktree(t, "clean")
+	unmerged := f.addWorktree(t, "unmerged")
+	ignored := f.addWorktree(t, "ignored")
+	if err := os.WriteFile(filepath.Join(ignored, "build.log"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirty := f.addWorktree(t, "dirty")
+	if err := os.WriteFile(filepath.Join(dirty, "notes"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	locked := f.addWorktree(t, "locked")
+	git(t, f.work, "worktree", "lock", locked)
+
+	merged := runCleanupWorktrees(t, f.work, false, true)
+
+	if got := kinds(merged); len(got) != 2 || got["clean"] == "" || got["ignored"] == "" {
+		t.Errorf("merged branches = %v, want clean and ignored", got)
+	}
+	assertBranches(t, f, "main", "unmerged", "dirty", "locked")
+	for path, want := range map[string]bool{clean: false, ignored: false, unmerged: true, dirty: true, locked: true} {
+		if got := exists(t, path); got != want {
+			t.Errorf("%s exists = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestKeepsWorktreesWithoutFlag(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "feature")
+	wt := f.addWorktree(t, "feature")
+
+	if merged := runCleanup(t, f.work, false); len(merged) != 0 {
+		t.Errorf("merged branches = %v, want none", kinds(merged))
+	}
+	assertBranches(t, f, "main", "feature")
+	if !exists(t, wt) {
+		t.Error("worktree was removed")
+	}
+}
+
+func TestDryRunKeepsWorktrees(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "feature")
+	wt := f.addWorktree(t, "feature")
+
+	if merged := runCleanupWorktrees(t, f.work, true, true); len(merged) != 1 || merged[0].Worktree == nil {
+		t.Errorf("merged branches = %v, want feature with its worktree", merged)
+	}
+	assertBranches(t, f, "main", "feature")
+	if !exists(t, wt) {
+		t.Error("worktree was removed")
+	}
+}
+
+func TestDeletesBranchOfMissingWorktree(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "feature")
+	wt := f.addWorktree(t, "feature")
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+
+	// The worktree is already gone, so this doesn't need -worktrees.
+	runCleanup(t, f.work, false)
+
+	assertBranches(t, f, "main")
+	if out := git(t, f.work, "worktree", "list", "--porcelain"); strings.Contains(out, "prunable") {
+		t.Errorf("worktree wasn't pruned:\n%s", out)
+	}
+}
+
+func TestKeepsMainWorktreeBranchFromLinkedWorktree(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "in-main", "current")
+	git(t, f.work, "switch", "--quiet", "in-main")
+	wt := f.addWorktree(t, "current")
+
+	if merged := runCleanupWorktrees(t, wt, false, true); len(merged) != 0 {
+		t.Errorf("merged branches = %v, want none", kinds(merged))
+	}
+	assertBranches(t, f, "main", "in-main", "current")
+}
+
+func TestParseWorktrees(t *testing.T) {
+	out := "worktree /repo\nHEAD 1111\nbranch refs/heads/main\n\n" +
+		"worktree /wt/a\nHEAD 2222\nbranch refs/heads/feat/a\nlocked in use\n\n" +
+		"worktree /wt/b\nHEAD 3333\ndetached\n\n" +
+		"worktree /wt/c\nHEAD 4444\nbranch refs/heads/c\nprunable gitdir file points to non-existent location\n"
+	want := []worktree{
+		{Path: "/repo", Branch: "main"},
+		{Path: "/wt/a", Branch: "feat/a", Locked: true},
+		{Path: "/wt/b"},
+		{Path: "/wt/c", Branch: "c", Prunable: true},
+	}
+	if got := parseWorktrees(out); !slices.Equal(got, want) {
+		t.Errorf("parseWorktrees = %+v, want %+v", got, want)
+	}
 }
 
 func TestDryRunDeletesNothing(t *testing.T) {
