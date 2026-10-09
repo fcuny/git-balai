@@ -71,8 +71,9 @@ const (
 )
 
 type branch struct {
-	Name string
-	SHA  string
+	Name   string
+	SHA    string // abbreviated, for logs
+	Commit string // full object name
 }
 
 type mergedBranch struct {
@@ -229,7 +230,7 @@ func (r *GitRepository) fetchPrimaryBranch() error {
 
 // localBranches returns all local branches with their abbreviated commit.
 func (r *GitRepository) localBranches() ([]branch, error) {
-	out, err := r.runGitCommand("for-each-ref", "--format=%(refname) %(objectname:short)", "refs/heads/")
+	out, err := r.runGitCommand("for-each-ref", "--format=%(refname) %(objectname) %(objectname:short)", "refs/heads/")
 	if err != nil {
 		return nil, err
 	}
@@ -237,13 +238,41 @@ func (r *GitRepository) localBranches() ([]branch, error) {
 	var branches []branch
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
-		ref, sha, ok := strings.Cut(scanner.Text(), " ")
-		if !ok {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 3 {
 			continue
 		}
-		branches = append(branches, branch{Name: strings.TrimPrefix(ref, "refs/heads/"), SHA: sha})
+		branches = append(branches, branch{
+			Name:   strings.TrimPrefix(fields[0], "refs/heads/"),
+			Commit: fields[1],
+			SHA:    fields[2],
+		})
 	}
 	return branches, scanner.Err()
+}
+
+// remoteBranches asks the remote for its branches and returns the commit each
+// one points to. The remote-tracking refs aren't used: they may be stale.
+func (r *GitRepository) remoteBranches() (map[string]string, error) {
+	out, err := r.runGitCommand("ls-remote", "--heads", r.RemoteName)
+	if err != nil {
+		return nil, err
+	}
+	return parseLsRemote(out), nil
+}
+
+// parseLsRemote parses the output of `git ls-remote --heads`.
+func parseLsRemote(out string) map[string]string {
+	heads := make(map[string]string)
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		commit, ref, ok := strings.Cut(scanner.Text(), "\t")
+		if !ok || !strings.HasPrefix(ref, "refs/heads/") {
+			continue
+		}
+		heads[strings.TrimPrefix(ref, "refs/heads/")] = commit
+	}
+	return heads
 }
 
 // ancestorBranches returns the local branches that are ancestors of the
@@ -527,9 +556,28 @@ func (r *GitRepository) deleteBranch(b mergedBranch) error {
 	return nil
 }
 
+// deleteRemoteBranch deletes the branch on the remote. The lease makes the
+// push fail if the remote branch moved since remoteBranches looked at it.
+// A successful push also drops the remote-tracking ref.
+func (r *GitRepository) deleteRemoteBranch(b mergedBranch) error {
+	lease := "--force-with-lease=refs/heads/" + b.Name + ":" + b.Commit
+	if _, err := r.runGitCommand("push", "--quiet", lease, "--delete", r.RemoteName, "refs/heads/"+b.Name); err != nil {
+		return fmt.Errorf("failed to delete remote branch %s/%s: %w", r.RemoteName, b.Name, err)
+	}
+	return nil
+}
+
+type cleanupOptions struct {
+	DryRun bool
+	// Worktrees removes the linked worktrees merged branches are checked out in.
+	Worktrees bool
+	// Remote also deletes the merged branches on the remote.
+	Remote bool
+}
+
 // cleanupMergedBranches deletes all local branches that have been merged into the primary branch
-func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) error {
-	mergedBranches, err := r.getMergedBranches(removeWorktrees)
+func (r *GitRepository) cleanupMergedBranches(opts cleanupOptions) error {
+	mergedBranches, err := r.getMergedBranches(opts.Worktrees)
 	if err != nil {
 		return err
 	}
@@ -539,14 +587,34 @@ func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) erro
 		return nil
 	}
 
+	// A remote branch is only deleted when it points to the same commit as
+	// the local one. Otherwise it has commits that weren't checked, or it is
+	// an unrelated branch with the same name.
+	var remoteHeads map[string]string
+	if opts.Remote {
+		if remoteHeads, err = r.remoteBranches(); err != nil {
+			return err
+		}
+	}
+	deleteRemote := func(b mergedBranch) bool {
+		commit, ok := remoteHeads[b.Name]
+		if ok && commit != b.Commit {
+			log.Printf("Keeping %s/%s: it points to %.7s, not %s", r.RemoteName, b.Name, commit, b.SHA)
+		}
+		return ok && commit == b.Commit
+	}
+
 	log.Printf("Found %d merged branches:", len(mergedBranches))
 	var errs []error
 	for _, b := range mergedBranches {
-		if dryRun {
+		if opts.DryRun {
 			if b.Worktree != nil {
 				log.Printf("Would remove worktree: %s", b.Worktree.Path)
 			}
 			log.Printf("Would delete: %s (%s, was %s)", b.Name, b.Kind, b.SHA)
+			if deleteRemote(b) {
+				log.Printf("Would delete remote branch: %s/%s", r.RemoteName, b.Name)
+			}
 			continue
 		}
 		if b.Worktree != nil {
@@ -563,6 +631,14 @@ func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) erro
 			continue
 		}
 		log.Printf("Deleted branch: %s (%s, was %s)", b.Name, b.Kind, b.SHA)
+		if deleteRemote(b) {
+			if err := r.deleteRemoteBranch(b); err != nil {
+				log.Printf("Error: %v", err)
+				errs = append(errs, err)
+				continue
+			}
+			log.Printf("Deleted remote branch: %s/%s", r.RemoteName, b.Name)
+		}
 	}
 
 	return errors.Join(errs...)
@@ -571,9 +647,10 @@ func (r *GitRepository) cleanupMergedBranches(dryRun, removeWorktrees bool) erro
 func main() {
 	dryRun := flag.Bool("dry-run", false, "show which branches would be deleted without deleting them")
 	removeWorktrees := flag.Bool("worktrees", false, "also remove clean, unlocked worktrees of merged branches")
+	deleteRemote := flag.Bool("remote", false, "also delete merged branches on the remote, if they point to the same commit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run] [-worktrees] [-version]\n\n"+
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: git-balai [-dry-run] [-worktrees] [-remote] [-version]\n\n"+
 			"Delete local branches that have been merged, rebased or squashed into the remote's primary branch.\n\n")
 		flag.PrintDefaults()
 	}
@@ -605,7 +682,8 @@ func main() {
 		log.Println("Running in dry-run mode")
 	}
 
-	if err := repo.cleanupMergedBranches(*dryRun, *removeWorktrees); err != nil {
+	opts := cleanupOptions{DryRun: *dryRun, Worktrees: *removeWorktrees, Remote: *deleteRemote}
+	if err := repo.cleanupMergedBranches(opts); err != nil {
 		log.Fatalf("Failed to cleanup merged branches: %v", err)
 	}
 }
