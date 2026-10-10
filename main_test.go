@@ -1,6 +1,7 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,15 +105,20 @@ func runCleanup(t *testing.T, dir string, dryRun bool) []mergedBranch {
 
 func runCleanupWorktrees(t *testing.T, dir string, dryRun, removeWorktrees bool) []mergedBranch {
 	t.Helper()
+	return runCleanupOpts(t, dir, cleanupOptions{DryRun: dryRun, Worktrees: removeWorktrees})
+}
+
+func runCleanupOpts(t *testing.T, dir string, opts cleanupOptions) []mergedBranch {
+	t.Helper()
 	repo, err := NewGitRepository(dir)
 	if err != nil {
 		t.Fatalf("NewGitRepository: %v", err)
 	}
-	merged, err := repo.getMergedBranches(removeWorktrees)
+	merged, err := repo.getMergedBranches(opts.Worktrees)
 	if err != nil {
 		t.Fatalf("getMergedBranches: %v", err)
 	}
-	if err := repo.cleanupMergedBranches(dryRun, removeWorktrees); err != nil {
+	if err := repo.cleanupMergedBranches(opts); err != nil {
 		t.Fatalf("cleanupMergedBranches: %v", err)
 	}
 	return merged
@@ -329,6 +335,71 @@ func TestKeepsMainWorktreeBranchFromLinkedWorktree(t *testing.T) {
 		t.Errorf("merged branches = %v, want none", kinds(merged))
 	}
 	assertBranches(t, f, "main", "in-main", "current")
+}
+
+func (f *fixture) remoteBranches(t *testing.T) []string {
+	t.Helper()
+	return strings.Fields(git(t, f.remote, "for-each-ref", "--format=%(refname:short)", "refs/heads/"))
+}
+
+func assertRemoteBranches(t *testing.T, f *fixture, want ...string) {
+	t.Helper()
+	got := f.remoteBranches(t)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("remote branches = %v, want %v", got, want)
+	}
+}
+
+func TestDeletesRemoteBranches(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "same", "moved")
+	f.pushFeature(t, "origin", "unmerged", "x")
+	// Someone pushed to moved after it was merged: that commit must not be lost.
+	git(t, f.other, "fetch", "--quiet", "origin")
+	git(t, f.other, "switch", "--quiet", "-c", "moved", "origin/moved")
+	commit(t, f.other, "late", "late\n")
+	git(t, f.other, "push", "--quiet", "origin", "moved")
+	// A merged branch that was never pushed.
+	git(t, f.work, "branch", "local-only", "main")
+
+	runCleanupOpts(t, f.work, cleanupOptions{Remote: true})
+
+	assertBranches(t, f, "main", "unmerged")
+	assertRemoteBranches(t, f, "main", "moved", "unmerged")
+	if out := git(t, f.work, "for-each-ref", "refs/remotes/origin/same"); out != "" {
+		t.Errorf("remote-tracking ref wasn't removed: %s", out)
+	}
+}
+
+func TestKeepsRemoteBranchesWithoutFlag(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "feature")
+
+	runCleanup(t, f.work, false)
+
+	assertBranches(t, f, "main")
+	assertRemoteBranches(t, f, "main", "feature")
+}
+
+func TestDryRunKeepsRemoteBranches(t *testing.T) {
+	f := newFixture(t, "origin")
+	f.mergeIntoRemote(t, "feature")
+
+	runCleanupOpts(t, f.work, cleanupOptions{DryRun: true, Remote: true})
+
+	assertBranches(t, f, "main", "feature")
+	assertRemoteBranches(t, f, "main", "feature")
+}
+
+func TestParseLsRemote(t *testing.T) {
+	out := "1111\trefs/heads/main\n2222\trefs/heads/feat/a\n3333\trefs/tags/v1\n"
+	got := parseLsRemote(out)
+	want := map[string]string{"main": "1111", "feat/a": "2222"}
+	if !maps.Equal(got, want) {
+		t.Errorf("parseLsRemote = %v, want %v", got, want)
+	}
 }
 
 func TestParseWorktrees(t *testing.T) {

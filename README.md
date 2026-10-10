@@ -17,6 +17,7 @@ With the binary on your `PATH`, it can also be run as `git balai`.
 git balai            # delete merged branches
 git balai -dry-run   # only show what would be deleted
 git balai -worktrees # also remove worktrees of merged branches
+git balai -remote    # also delete merged branches on the remote
 git balai -version   # print the version
 ```
 
@@ -42,6 +43,13 @@ branch is deleted, but only if the worktree is not locked and has no modified
 or untracked files. Ignored files (build output, `.env`, ...) don't count as
 changes and are removed with the worktree, so check with `-dry-run` first.
 A worktree whose directory was already deleted is pruned without `-worktrees`.
+
+With `-remote`, each deleted branch is also deleted on the remote, but only if
+the remote branch points to the same commit as the local one. A remote branch
+that has moved (someone pushed to it after it landed) or that is unrelated but
+shares the name is kept. The remote is queried directly rather than through
+the possibly stale remote-tracking refs, and the push uses
+`--force-with-lease` so it fails if the branch moves in the meantime.
 
 A squash merge whose conflicts were resolved differently from the branch, or
 that was edited before landing, won't match and the branch is kept.
