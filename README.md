@@ -60,6 +60,7 @@ that was edited before landing, won't match and the branch is kept.
 make          # lint, test and build into bin/
 make test
 make lint
+make release VERSION=v0.2.0  # tag main and push the tag
 ```
 
 ## License
